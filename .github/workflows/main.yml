@@ -19,7 +19,7 @@ jobs:
           TOKEN = os.environ["TG_BOT_TOKEN"]
           CHAT_ID = os.environ["TG_CHAT_ID"]
 
-          url = f"https://api.dimap.live/api/targets?_refresh={int(time.time() * 1000)}"
+          url = f"https://api.dimap.live/api/targets?_refresh={int(time.time() * 10000)}"
           req = urllib.request.Request(url, headers={
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
               "Accept": "application/json, text/plain, */*",
