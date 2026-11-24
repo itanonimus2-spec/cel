@@ -1,4 +1,4 @@
-name: Test First 5 Targets (20s timeout)
+name: Test First 5 Targets (Custom Headers)
 
 on:
   workflow_dispatch: {}
@@ -8,28 +8,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Send first 5 targets with 20s timeout
+      - name: Send first 5 targets with custom headers
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           python3 - <<'EOF'
-          import json, os, time, urllib.request, urllib.parse
+          import gzip, io, json, os, time, urllib.request, urllib.parse, zlib
 
           TOKEN = os.environ["TG_BOT_TOKEN"]
           CHAT_ID = os.environ["TG_CHAT_ID"]
 
-          url = f"https://api.dimap.live/api/targets?_refresh={int(time.time() * 10000)}"
-          req = urllib.request.Request(url, headers={
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-              "Accept": "application/json, text/plain, */*",
-              "Referer": "https://dimap.live/",
-              "Origin": "https://dimap.live",
-          })
+          url = f"https://api.dimap.live/api/targets?_refresh={int(time.time() * 5000)}"
+          headers = {
+              "Host": "api.dimap.live",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Accept-Encoding": "gzip, deflate",
+              "Connection": "keep-alive",
+              "Cookie": "cf_clearance=Cr8BXATyCPalQSrwrUrp9k3p4YK__gQYa5a4GMsCtXBmPEIWv3YYgpQ9b-kGSi91UQevX-vNfhjhYEG-glUa_aXzaHlNhvVCaswDeuSmy4A9mIT4XCLdPWwtQVk9YA6X5m3qy02DcVmI3vk12hzSJ_IiczX15-i4dti9zlJMbuUcvjf3sDgftnWOmVILNfJKaykeYiNXCtEPV8uLMO52upbQbfMnh69v7jq_Qpk24g9PZv8wWXq7zohbobkuDWZnX72ZpMxocJxU8rd53zYAEWOOd1ZNLwXVAzRa9XRBrG5kz7E5JZ-Ny1jRWxBgDSuDRnifPD5k4JgGzB7DLs2k609zUdhZ0hbcrypBohQwUpvFA5POgHQj79a0Jfc8H6qX-XzCqpRzuuDieurgoK8eC6OFMmttArTex9PlQ5ozKd8NFwLFkxA7TeNDdBPj0ERdpx9fP7m7DiATKucYAttuWml0adiJwSKQrwFtO_WVqoHERSb7vEFkV4GCzIzqmnrIHSigDhP7Bnb6Kp5r2krFqG5VuSaIgEOfWJyNs-qlSpt5MIaj8UpS0QF38qooDlYv96xYEVEb_ywzNaqGJVaKZwYmTIu7kILc-z6INlD2ien39SRmiiVseb2uUJERjpRLIiJmjg38jGkjyno5gg",
+              "Upgrade-Insecure-Requests": "1",
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-User": "?1",
+              "Priority": "u=0, i",
+              "TE": "trailers",
+          }
+
+          req = urllib.request.Request(url, headers=headers)
 
           try:
               with urllib.request.urlopen(req, timeout=20) as resp:
-                  data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                  raw_bytes = resp.read()
+                  enc = (resp.headers.get("Content-Encoding") or "").lower()
+                  if "gzip" in enc:
+                      raw_bytes = gzip.GzipFile(fileobj=io.BytesIO(raw_bytes)).read()
+                  elif "deflate" in enc:
+                      raw_bytes = zlib.decompress(raw_bytes)
+                  data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
           except Exception as e:
               print(f"API error: {e}")
               raise SystemExit(1)
