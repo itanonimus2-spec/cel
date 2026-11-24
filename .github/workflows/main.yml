@@ -1,0 +1,191 @@
+name: Dnipro Air Monitor (30s)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore notified state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: dnipro-state-${{ github.run_id }}
+          restore-keys: |
+            dnipro-state-
+
+      - name: Run 30s monitoring loop (4.5 mins)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python3 - <<'EOF'
+          import json, math, os, time, urllib.request, urllib.parse
+          from datetime import datetime, timezone, timedelta
+
+          TOKEN = os.environ["TG_BOT_TOKEN"]
+          CHAT_ID = os.environ["TG_CHAT_ID"]
+          STATE_FILE = "state.json"
+          KYIV_TZ = timezone(timedelta(hours=2))
+
+          SETTLEMENTS = {
+              "Дніпро": (48.4647, 35.0462),
+              "Кам’янське": (48.5087, 34.6138),
+              "Кривий Ріг": (47.9105, 33.3918),
+              "Павлоград": (48.5167, 35.8667),
+              "Нікополь": (47.5712, 34.3964),
+              "Самар": (48.6286, 35.2258),
+              "Синельникове": (48.3167, 35.5167),
+              "Покров": (47.6531, 34.0889),
+              "Марганець": (47.6389, 34.6147),
+              "Жовті Води": (48.3481, 33.5042),
+              "Першотравенськ": (48.3458, 36.3958),
+              "Тернівка": (48.5269, 36.0772),
+              "Вільногірськ": (48.4778, 34.0278),
+              "П’ятихатки": (48.4042, 33.7042),
+              "Верхівцеве": (48.4819, 34.2444),
+              "Підгородне": (48.5833, 35.1000),
+              "Апостолове": (47.6583, 33.7139),
+              "Зеленодольськ": (47.4833, 33.6333),
+              "Царичанка": (48.9431, 34.4778),
+              "Петриківка": (48.7264, 34.6306),
+              "Магдалинівка": (48.9325, 35.2917),
+              "Васильківка": (48.2042, 36.2222),
+              "Покровське": (47.9833, 36.2333),
+              "Межова": (48.2556, 36.7278),
+              "Солоне": (48.2056, 34.8639),
+              "Кринички": (48.3722, 34.4583),
+              "Томаківка": (47.7917, 34.7417),
+              "Широке": (47.6806, 33.2583),
+              "Софіївка": (48.0528, 33.8972),
+          }
+
+          def load_state():
+              if os.path.exists(STATE_FILE):
+                  try:
+                      with open(STATE_FILE, "r", encoding="utf-8") as f:
+                          return json.load(f)
+                  except Exception:
+                      pass
+              return {}
+
+          def save_state(state):
+              now = time.time()
+              cleaned = {k: v for k, v in state.items() if (now - float(v)) < 7200}
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(cleaned, f)
+
+          def haversine_km(lat1, lng1, lat2, lng2):
+              r = 6371.0
+              p1, p2 = math.radians(lat1), math.radians(lat2)
+              dp = math.radians(lat2 - lat1)
+              dl = math.radians(lng2 - lng1)
+              a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+              return r * 2 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+          def nearest_city(lat, lng):
+              best_name, best_km = None, 10**9
+              for name, (c_lat, c_lng) in SETTLEMENTS.items():
+                  d = haversine_km(lat, lng, c_lat, c_lng)
+                  if d < best_km:
+                      best_name, best_km = name, d
+              return best_name, round(best_km, 1)
+
+          def send_tg(text):
+              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+              payload = urllib.parse.urlencode({
+                  "chat_id": CHAT_ID,
+                  "text": text,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "true",
+              }).encode("utf-8")
+              req = urllib.request.Request(url, data=payload, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return json.loads(resp.read().decode("utf-8")).get("ok", False)
+              except Exception as e:
+                  print(f"TG error: {e}")
+                  return False
+
+          def check_once(state):
+              url = f"https://api.dimap.live/api/targets?_refresh={int(time.time() * 1000)}"
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "application/json",
+                  "Referer": "https://dimap.live/",
+                  "Origin": "https://dimap.live",
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      data = json.loads(resp.read().decode("utf-8", errors="replace"))
+              except Exception as e:
+                  print(f"API error: {e}")
+                  return 0
+
+              targets = data.get("targets") or []
+              sent = 0
+              now_str = datetime.now(KYIV_TZ).strftime("%H:%M:%S")
+
+              for t in targets:
+                  if not isinstance(t, dict):
+                      continue
+                  tid = str(t.get("id") or "")
+                  if not tid:
+                      continue
+
+                  lat = t.get("lat")
+                  lng = t.get("lng")
+                  if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+                      continue
+                  if not (47.20 <= lat <= 49.20 and 32.60 <= lng <= 36.90):
+                      continue
+
+                  status = str(t.get("status") or "")
+                  is_lost = (status == "lost")
+                  event_key = f"{tid}:{'lost' if is_lost else 'active'}"
+                  if event_key in state:
+                      continue
+
+                  city, km = nearest_city(float(lat), float(lng))
+                  name = t.get("name") or t.get("type") or "Повітряна ціль"
+                  ttype = t.get("type") or "ціль"
+                  speed = f"{round(float(t['speed']))} км/год" if isinstance(t.get("speed"), (int, float)) else "н/д"
+                  bearing = f"{round(float(t['bearing']))}°" if isinstance(t.get("bearing"), (int, float)) else "н/д"
+
+                  icon = "⚪" if is_lost else "🔴"
+                  header = t.get("statusUa") or "Ціль втрачена" if is_lost else "Активна ціль — Дніпропетровська обл."
+
+                  history = t.get("history") or []
+                  pts = [f"[{h.get('time', '')}] {h.get('name', '')}".strip() for h in history if isinstance(h, dict) and h.get("name")][-3:]
+                  route_line = f"\n🛣 <b>Маршрут:</b> {' → '.join(pts)}" if pts else ""
+
+                  text = (
+                      f"{icon} <b>{header}</b>\n"
+                      f"━━━━━━━━━━━━━━━━━━━━\n"
+                      f"🎯 <b>Об’єкт:</b> {name} (<code>{ttype}</code>)\n"
+                      f"📍 <b>Населений пункт:</b> поблизу <u>{city}</u> (~{km} км)\n"
+                      f"⚡ <b>Швидкість / курс:</b> <code>{speed}</code> / <code>{bearing}</code>\n"
+                      f"🧭 <b>Координати:</b> <code>{lat}, {lng}</code>"
+                      f"{route_line}\n"
+                      f"🕒 <b>Час оновлення:</b> {now_str}"
+                  )
+
+                  if send_tg(text):
+                      state[event_key] = time.time()
+                      sent += 1
+
+              print(f"[{now_str}] Checked. Sent: {sent}")
+              return sent
+
+          state = load_state()
+          for i in range(9):
+              t0 = time.time()
+              check_once(state)
+              save_state(state)
+              if i < 8:
+                  time.sleep(max(1.0, 30.0 - (time.time() - t0)))
+          EOF
