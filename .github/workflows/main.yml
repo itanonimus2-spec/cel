@@ -1,63 +1,232 @@
-name: Send Static Target to TG
+name: Dnipro Air Monitor (Grupdndz Feed)
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 jobs:
-  send-static:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     steps:
-      - name: Send static test target to Telegram
+      - name: Restore notified state
+        uses: actions/cache@v4
+        with:
+          path: dnipro_neptun_state.json
+          key: dnipro-grupdndz-${{ github.run_id }}
+          restore-keys: |
+            dnipro-grupdndz-
+
+      - name: Fetch feed and notify Telegram
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FEED_URL: "https://grupdndz.infinityfreeapp.com/"
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.request, urllib.parse
+          import gzip
+          import io
+          import json
+          import math
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          import zlib
 
           TOKEN = os.environ["TG_BOT_TOKEN"]
           CHAT_ID = os.environ["TG_CHAT_ID"]
+          FEED_URL = os.environ["FEED_URL"]
+          STATE_FILE = "dnipro_neptun_state.json"
 
-          static_target = {
-              "id": "test-99901",
-              "name": "БпЛА (тест)",
-              "type": "fpv",
-              "status": "active",
-              "lat": 48.5087,
-              "lng": 34.6138,
-              "speed": 140,
-              "bearing": 215,
-              "city": "Кам’янське",
+          # Границы Днепропетровской области
+          LAT_MIN, LAT_MAX = 47.2, 49.2
+          LON_MIN, LON_MAX = 32.6, 36.9
+
+          SETTLEMENTS = {
+              "Дніпро": (48.4647, 35.0462),
+              "Кривий Ріг": (47.9105, 33.3918),
+              "Кам’янське": (48.5087, 34.6138),
+              "Нікополь": (47.5712, 34.3964),
+              "Павлоград": (48.5167, 35.8667),
+              "Новомосковськ": (48.6333, 35.2250),
+              "Марганець": (47.6431, 34.6136),
+              "Покров": (47.6514, 34.0842),
+              "Синельникове": (48.3167, 35.5167),
+              "Першотравенськ": (48.3489, 36.4036),
+              "Тернівка": (48.5242, 36.0778),
+              "Вільногірськ": (48.4789, 34.0272),
+              "П’ятихатки": (48.4119, 33.7022),
+              "Апостолове": (47.6572, 33.7117),
+              "Царичанка": (48.9400, 34.4600),
+              "Покровське": (47.9833, 36.2333),
           }
 
-          text = (
-              f"🔴 <b>Тестове сповіщення (статична ціль)</b>\n"
-              f"━━━━━━━━━━━━━━━━━━━━\n"
-              f"🎯 <b>Об’єкт:</b> {static_target['name']} (<code>{static_target['type']}</code>)\n"
-              f"📍 <b>Населений пункт:</b> <u>{static_target['city']}</u>\n"
-              f"⚡ <b>Швидкість / курс:</b> <code>{static_target['speed']} км/год</code> / <code>{static_target['bearing']}°</code>\n"
-              f"🧭 <b>Координати:</b> <code>{static_target['lat']}, {static_target['lng']}</code>\n"
-              f"🆔 <b>ID:</b> <code>{static_target['id']}</code>"
-          )
+          def haversine_km(lat1, lon1, lat2, lon2):
+              r = 6371.0
+              p1 = math.radians(lat1)
+              p2 = math.radians(lat2)
+              dp = math.radians(lat2 - lat1)
+              dl = math.radians(lon2 - lon1)
+              a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+              return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
-          tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-          payload = urllib.parse.urlencode({
-              "chat_id": CHAT_ID,
-              "text": text,
-              "parse_mode": "HTML",
-              "disable_web_page_preview": "true",
-          }).encode("utf-8")
+          def nearest_settlement(lat, lon):
+              best_name = None
+              best_dist = None
+              for name, (slat, slon) in SETTLEMENTS.items():
+                  d = haversine_km(lat, lon, slat, slon)
+                  if best_dist is None or d < best_dist:
+                      best_dist = d
+                      best_name = name
+              return best_name, round(best_dist, 1) if best_dist is not None else None
 
-          req = urllib.request.Request(tg_url, data=payload, method="POST")
-          try:
+          def is_dnipro_region(threat):
+              region = str(threat.get("region") or "").lower()
+              if "дніпропетров" in region or "днепропетров" in region:
+                  return True
+              try:
+                  lat = float(threat.get("lat"))
+                  lon = float(threat.get("lon"))
+              except (TypeError, ValueError):
+                  return False
+              return (LAT_MIN <= lat <= LAT_MAX) and (LON_MIN <= lon <= LON_MAX)
+
+          def load_state():
+              if not os.path.exists(STATE_FILE):
+                  return {"sent": {}}
+              try:
+                  with open(STATE_FILE, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+                  if isinstance(data, dict) and isinstance(data.get("sent"), dict):
+                      return data
+              except Exception:
+                  pass
+              return {"sent": {}}
+
+          def save_state(state):
+              sent = state.get("sent", {})
+              if len(sent) > 500:
+                  keys = list(sent.keys())[-500:]
+                  state["sent"] = {k: sent[k] for k in keys}
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(state, f, ensure_ascii=False, indent=2)
+
+          def fetch_feed():
+              sep = "&" if "?" in FEED_URL else "?"
+              url = f"{FEED_URL}{sep}_refresh={int(time.time() * 1000)}"
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
+                  "Accept": "application/json, text/plain, */*",
+                  "Accept-Encoding": "gzip, deflate",
+                  "Cache-Control": "no-cache",
+              }
+              req = urllib.request.Request(url, headers=headers)
               with urllib.request.urlopen(req, timeout=20) as resp:
-                  body = resp.read().decode("utf-8", errors="replace")
-                  res = json.loads(body)
-                  print("TG response:", res)
+                  raw = resp.read()
+                  enc = (resp.headers.get("Content-Encoding") or "").lower()
+                  if "gzip" in enc:
+                      raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+                  elif "deflate" in enc:
+                      raw = zlib.decompress(raw)
+                  text = raw.decode("utf-8", errors="replace").strip()
+
+              try:
+                  return json.loads(text)
+              except Exception as e:
+                  snippet = " ".join(text.split())[:220]
+                  raise RuntimeError(f"Feed did not return valid JSON ({e}): {snippet}")
+
+          def send_tg(text):
+              tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+              payload = urllib.parse.urlencode({
+                  "chat_id": CHAT_ID,
+                  "text": text,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "true",
+              }).encode("utf-8")
+              req = urllib.request.Request(tg_url, data=payload, method="POST")
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  res = json.loads(resp.read().decode("utf-8", errors="replace"))
                   if not res.get("ok"):
-                      raise SystemExit(1)
+                      raise RuntimeError(f"Telegram API error: {res}")
+
+          try:
+              payload_data = fetch_feed()
           except Exception as e:
-              print("TG error:", e)
+              print(f"Feed fetch error: {e}")
               raise SystemExit(1)
+
+          threats = payload_data.get("threats") or []
+          dnipro_threats = [t for t in threats if isinstance(t, dict) and is_dnipro_region(t)]
+          print(f"Total threats: {len(threats)} | Dnipro region threats: {len(dnipro_threats)}")
+
+          state = load_state()
+          sent_map = state["sent"]
+          new_count = 0
+
+          for t in dnipro_threats:
+              tid = str(t.get("id") or "")
+              if not tid:
+                  continue
+              stamp = f"{t.get('updatedAt', '')}|{t.get('detailsRev', '')}|{t.get('status', '')}"
+              if sent_map.get(tid) == stamp:
+                  continue
+
+              title = t.get("title") or "Повітряна ціль"
+              ttype = t.get("type") or "-"
+              subtype = t.get("subtype") or ""
+              type_str = f"{ttype}/{subtype}" if subtype else str(ttype)
+
+              region = t.get("region") or "Дніпропетровська область"
+              locality = t.get("locality") or "—"
+              heading = t.get("heading")
+              heading_str = f"{heading}°" if heading not in (None, "") else "не вказано"
+
+              lat = t.get("lat")
+              lon = t.get("lon")
+              coords_str = f"{lat}, {lon}" if lat is not None and lon is not None else "—"
+
+              near_str = ""
+              try:
+                  near_name, near_km = nearest_settlement(float(lat), float(lon))
+                  if near_name and near_km is not None:
+                      near_str = f"\n📌 <b>Найближчий орієнтир:</b> {near_name} (~<code>{near_km} км</code>)"
+              except (TypeError, ValueError):
+                  pass
+
+              sources = t.get("sourceCount")
+              conf = t.get("confidenceLevel") or t.get("displayConfidence") or "-"
+              short_desc = t.get("explanationShort") or ""
+              updated_at = t.get("updatedAt") or ""
+
+              lines = [
+                  f"🚨 <b>{title}</b> (<code>{type_str}</code>)",
+                  f"━━━━━━━━━━━━━━━━━━━━",
+                  f"🗺 <b>Регіон:</b> {region}",
+                  f"🏙 <b>Населений пункт:</b> {locality}{near_str}",
+                  f"🧭 <b>Курс:</b> <code>{heading_str}</code>",
+                  f"📍 <b>Координати:</b> <code>{coords_str}</code>",
+                  f"🛡 <b>Підтверджень:</b> <code>{sources}</code> (<code>{conf}</code>)",
+              ]
+              if short_desc:
+                  lines.append(f"ℹ️ {short_desc}")
+              if updated_at:
+                  lines.append(f"🕒 <code>{updated_at}</code>")
+              lines.append(f"🆔 <code>{tid}</code>")
+
+              message_text = "\n".join(lines)
+
+              try:
+                  send_tg(message_text)
+                  sent_map[tid] = stamp
+                  new_count += 1
+                  print(f"Sent threat {tid} ({title} - {locality})")
+                  time.sleep(0.4)
+              except Exception as e:
+                  print(f"Failed to send threat {tid}: {e}")
+
+          save_state(state)
+          print(f"Done. Newly sent: {new_count}")
           EOF
