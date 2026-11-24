@@ -2,13 +2,13 @@ name: Neptun Live Dnipro Monitor
 
 on:
   schedule:
-    - cron: '* * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Restore notified state
         uses: actions/cache@v4
@@ -18,13 +18,15 @@ jobs:
           restore-keys: |
             dnipro-neptun-live-
 
-      - name: Fetch Neptun live API and send alerts to Telegram
+      - name: Monitor Neptun live API every ~60s and send alerts to Telegram
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           NEPTUN_CF_CLEARANCE: ${{ secrets.NEPTUN_CF_CLEARANCE }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python3 - <<'EOF'
+          import datetime
           import gzip
           import http.cookiejar
           import io
@@ -39,6 +41,7 @@ jobs:
           TOKEN = os.environ["TG_BOT_TOKEN"]
           CHAT_ID = os.environ["TG_CHAT_ID"]
           CF_CLEARANCE = os.environ.get("NEPTUN_CF_CLEARANCE", "").strip()
+          EVENT_NAME = os.environ.get("EVENT_NAME", "unknown")
           STATE_FILE = "dnipro_neptun_state.json"
 
           # Границы Днепропетровской области
@@ -63,6 +66,9 @@ jobs:
               "Царичанка": (48.9400, 34.4600),
               "Покровське": (47.9833, 36.2333),
           }
+
+          def now_utc():
+              return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
           def haversine_km(lat1, lon1, lat2, lon2):
               r = 6371.0
@@ -114,10 +120,6 @@ jobs:
               with open(STATE_FILE, "w", encoding="utf-8") as f:
                   json.dump(state, f, ensure_ascii=False, indent=2)
 
-          def build_opener():
-              cj = http.cookiejar.CookieJar()
-              return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-
           def decode_response_body(resp):
               raw = resp.read()
               enc = (resp.headers.get("Content-Encoding") or "").lower()
@@ -128,7 +130,8 @@ jobs:
               return raw.decode("utf-8", errors="replace").strip()
 
           def fetch_neptun_live():
-              opener = build_opener()
+              cj = http.cookiejar.CookieJar()
+              opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
               headers = {
                   "Accept": "*/*",
                   "Accept-Encoding": "gzip, deflate",
@@ -148,32 +151,13 @@ jobs:
               if CF_CLEARANCE:
                   headers["Cookie"] = f"cf_clearance={CF_CLEARANCE}"
 
-              # Легкий прогрев главной страницы перед запросом к API
-              try:
-                  warm_req = urllib.request.Request("https://neptun.in.ua/", headers={
-                      "User-Agent": headers["User-Agent"],
-                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                      "Accept-Language": headers["Accept-Language"],
-                      "Cookie": headers.get("Cookie", ""),
-                  })
-                  with opener.open(warm_req, timeout=15) as _:
-                      pass
-              except Exception:
-                  pass
-
               api_req = urllib.request.Request("https://neptun.in.ua/api/v1/live", headers=headers)
               with opener.open(api_req, timeout=20) as resp:
                   text = decode_response_body(resp)
 
-              try:
-                  data = json.loads(text)
-              except Exception as e:
-                  snippet = " ".join(text.split())[:220]
-                  raise RuntimeError(f"Neptun returned non-JSON ({e}): {snippet}")
-
+              data = json.loads(text)
               if not isinstance(data, dict) or not isinstance(data.get("threats"), list):
-                  raise RuntimeError(f"Unexpected Neptun payload structure: {str(data)[:220]}")
-
+                  raise RuntimeError(f"Unexpected payload: {str(data)[:200]}")
               return data
 
           def send_tg(text):
@@ -190,81 +174,93 @@ jobs:
                   if not res.get("ok"):
                       raise RuntimeError(f"Telegram API error: {res}")
 
-          try:
-              payload_data = fetch_neptun_live()
-          except Exception as e:
-              print(f"Neptun fetch error: {e}")
-              raise SystemExit(1)
-
-          threats = payload_data.get("threats") or []
-          dnipro_threats = [t for t in threats if isinstance(t, dict) and is_dnipro_region(t)]
-          print(f"Total threats: {len(threats)} | Dnipro region threats: {len(dnipro_threats)}")
-
           state = load_state()
           sent_map = state["sent"]
-          new_count = 0
+          total_new = 0
 
-          for t in dnipro_threats:
-              tid = str(t.get("id") or "")
-              if not tid:
-                  continue
-              stamp = f"{t.get('updatedAt', '')}|{t.get('detailsRev', '')}|{t.get('status', '')}"
-              if sent_map.get(tid) == stamp:
-                  continue
-
-              title = t.get("title") or "Повітряна ціль"
-              ttype = t.get("type") or "-"
-              subtype = t.get("subtype") or ""
-              type_str = f"{ttype}/{subtype}" if subtype else str(ttype)
-
-              region = t.get("region") or "Дніпропетровська область"
-              locality = t.get("locality") or "—"
-              heading = t.get("heading")
-              heading_str = f"{heading}°" if heading not in (None, "") else "не вказано"
-
-              lat = t.get("lat")
-              lon = t.get("lon")
-              coords_str = f"{lat}, {lon}" if lat is not None and lon is not None else "—"
-
-              near_str = ""
+          # 4 цикла проверки с шагом ~60 сек внутри одного запуска
+          cycles = 4
+          for cycle in range(1, cycles + 1):
+              print(f"[{now_utc()}] Event={EVENT_NAME} | Cycle {cycle}/{cycles}")
               try:
-                  near_name, near_km = nearest_settlement(float(lat), float(lon))
-                  if near_name and near_km is not None:
-                      near_str = f"\n📌 <b>Найближчий орієнтир:</b> {near_name} (~<code>{near_km} км</code>)"
-              except (TypeError, ValueError):
-                  pass
-
-              sources = t.get("sourceCount")
-              conf = t.get("confidenceLevel") or t.get("displayConfidence") or "-"
-              short_desc = t.get("explanationShort") or ""
-              updated_at = t.get("updatedAt") or ""
-
-              lines = [
-                  f"🚨 <b>{title}</b> (<code>{type_str}</code>)",
-                  f"━━━━━━━━━━━━━━━━━━━━",
-                  f"🗺 <b>Регіон:</b> {region}",
-                  f"🏙 <b>Населений пункт:</b> {locality}{near_str}",
-                  f"🧭 <b>Курс:</b> <code>{heading_str}</code>",
-                  f"📍 <b>Координати:</b> <code>{coords_str}</code>",
-                  f"🛡 <b>Підтверджень:</b> <code>{sources}</code> (<code>{conf}</code>)",
-              ]
-              if short_desc:
-                  lines.append(f"ℹ️ {short_desc}")
-              if updated_at:
-                  lines.append(f"🕒 <code>{updated_at}</code>")
-              lines.append(f"🆔 <code>{tid}</code>")
-
-              message_text = "\n".join(lines)
-
-              try:
-                  send_tg(message_text)
-                  sent_map[tid] = stamp
-                  new_count += 1
-                  print(f"Sent threat {tid} ({title} - {locality})")
-                  time.sleep(0.4)
+                  payload_data = fetch_neptun_live()
               except Exception as e:
-                  print(f"Failed to send threat {tid}: {e}")
+                  print(f"[{now_utc()}] Fetch error on cycle {cycle}: {e}")
+                  if cycle < cycles:
+                      time.sleep(60)
+                  continue
+
+              threats = payload_data.get("threats") or []
+              dnipro_threats = [t for t in threats if isinstance(t, dict) and is_dnipro_region(t)]
+              print(f"[{now_utc()}] Total={len(threats)} | Dnipro={len(dnipro_threats)}")
+
+              cycle_new = 0
+              for t in dnipro_threats:
+                  tid = str(t.get("id") or "")
+                  if not tid:
+                      continue
+                  stamp = f"{t.get('updatedAt', '')}|{t.get('detailsRev', '')}|{t.get('status', '')}"
+                  if sent_map.get(tid) == stamp:
+                      continue
+
+                  title = t.get("title") or "Повітряна ціль"
+                  ttype = t.get("type") or "-"
+                  subtype = t.get("subtype") or ""
+                  type_str = f"{ttype}/{subtype}" if subtype else str(ttype)
+
+                  region = t.get("region") or "Дніпропетровська область"
+                  locality = t.get("locality") or "—"
+                  heading = t.get("heading")
+                  heading_str = f"{heading}°" if heading not in (None, "") else "не вказано"
+
+                  lat = t.get("lat")
+                  lon = t.get("lon")
+                  coords_str = f"{lat}, {lon}" if lat is not None and lon is not None else "—"
+
+                  near_str = ""
+                  try:
+                      near_name, near_km = nearest_settlement(float(lat), float(lon))
+                      if near_name and near_km is not None:
+                          near_str = f"\n📌 <b>Найближчий орієнтир:</b> {near_name} (~<code>{near_km} км</code>)"
+                  except (TypeError, ValueError):
+                      pass
+
+                  sources = t.get("sourceCount")
+                  conf = t.get("confidenceLevel") or t.get("displayConfidence") or "-"
+                  short_desc = t.get("explanationShort") or ""
+                  updated_at = t.get("updatedAt") or ""
+
+                  lines = [
+                      f"🚨 <b>{title}</b> (<code>{type_str}</code>)",
+                      f"━━━━━━━━━━━━━━━━━━━━",
+                      f"🗺 <b>Регіон:</b> {region}",
+                      f"🏙 <b>Населений пункт:</b> {locality}{near_str}",
+                      f"🧭 <b>Курс:</b> <code>{heading_str}</code>",
+                      f"📍 <b>Координати:</b> <code>{coords_str}</code>",
+                      f"🛡 <b>Підтверджень:</b> <code>{sources}</code> (<code>{conf}</code>)",
+                  ]
+                  if short_desc:
+                      lines.append(f"ℹ️ {short_desc}")
+                  if updated_at:
+                      lines.append(f"🕒 <code>{updated_at}</code>")
+                  lines.append(f"🆔 <code>{tid}</code>")
+
+                  message_text = "\n".join(lines)
+
+                  try:
+                      send_tg(message_text)
+                      sent_map[tid] = stamp
+                      cycle_new += 1
+                      total_new += 1
+                      print(f"[{now_utc()}] Sent {tid} ({title} - {locality})")
+                      time.sleep(0.4)
+                  except Exception as e:
+                      print(f"[{now_utc()}] TG send error {tid}: {e}")
+
+              print(f"[{now_utc()}] Cycle {cycle} finished. New sent: {cycle_new}")
+              if cycle < cycles:
+                  time.sleep(60)
 
           save_state(state)
-          print(f"Done. Newly sent: {new_count}")
+          print(f"[{now_utc()}] Run finished. Total newly sent: {total_new}")
           EOF
